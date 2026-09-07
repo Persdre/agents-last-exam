@@ -101,11 +101,61 @@ def _ttm_rows(index_rows, fin_rows):
     return out
 
 
-def _bundle(index_rows, fin_rows, ttm_rows):
+def _cmp_rows(reports=REPORTS):
+    """Prior-year comparatives: original = previous year's own figure; one silent restatement injected for 000930 FY2023's 2022 column."""
+    own = {(t, p): (rv, np_) for t, a, d, p, rt, c, rv, np_ in reports if c == 0}
+    rows = []
+    for t, a, d, p, rt, c, rv, np_ in reports:
+        prior = f"{int(p[:4]) - 1}{p[4:]}"
+        o = own.get((t, prior))
+        if o is None:
+            rows.append(
+                {
+                    "ticker": t,
+                    "report_period": p,
+                    "announcement_id": a,
+                    "prior_period": prior,
+                    "prior_revenue_original": "",
+                    "prior_revenue_restated": "",
+                    "prior_np_original": "",
+                    "prior_np_restated": "",
+                    "restated": "0",
+                }
+            )
+            continue
+        rv_r, np_r, flag = o[0], o[1], "0"
+        if a == "a4":  # 600519 H1 2024 prints a restated H1 2023 net profit
+            np_r, flag = o[1] - 5.0, "1"
+        rows.append(
+            {
+                "ticker": t,
+                "report_period": p,
+                "announcement_id": a,
+                "prior_period": prior,
+                "prior_revenue_original": f"{o[0]:.2f}",
+                "prior_revenue_restated": f"{rv_r:.2f}",
+                "prior_np_original": f"{o[1]:.2f}",
+                "prior_np_restated": f"{np_r:.2f}",
+                "restated": flag,
+            }
+        )
+    return rows
+
+
+def _log_rows(cmp_rows, index_rows):
+    d = SCORER.derive_restatement_log(cmp_rows, index_rows)
+    return [{"ticker": t, "prior_period": p, **v} for (t, p), v in sorted(d.items())]
+
+
+def _bundle(index_rows, fin_rows, ttm_rows, cmp_rows=None, log_rows=None):
+    cmp_rows = _cmp_rows() if cmp_rows is None else cmp_rows
+    log_rows = _log_rows(cmp_rows, index_rows) if log_rows is None else log_rows
     return {
         "reports_index.csv": _csv(index_rows, SCORER.INDEX_COLUMNS).encode(),
         "financials_ytd.csv": _csv(fin_rows, SCORER.FIN_COLUMNS).encode(),
         "pit_ttm.csv": _csv(ttm_rows, SCORER.TTM_COLUMNS).encode(),
+        "comparatives.csv": _csv(cmp_rows, SCORER.CMP_COLUMNS).encode(),
+        "restatement_log.csv": _csv(log_rows, SCORER.LOG_COLUMNS).encode(),
     }
 
 
@@ -247,7 +297,8 @@ def test_ignoring_correction_loses_ttm_credit_only_where_it_bites(reference):
     fin2 = [r for r in fin if r["announcement_id"] != "b6"]
     ttm2 = _ttm_rows(idx2, fin2)
     dl2 = {k: v for k, v in downloads.items() if k != "b6"}
-    result = SCORER.score_submission(_bundle(idx2, fin2, ttm2), dl2, ref)
+    cmp2 = [r for r in _cmp_rows() if r["announcement_id"] != "b6"]
+    result = SCORER.score_submission(_bundle(idx2, fin2, ttm2, cmp2), dl2, ref)
     assert not result.component_errors
     assert result.n_downloads_ok == len(REPORTS) - 1
     assert result.n_ttm_rows_ok == len(TICKERS) * len(AS_OF) - 1
@@ -271,7 +322,12 @@ def test_wrong_unit_zeroes_financials_and_ttm(reference):
     assert not result.component_errors
     assert result.financials_score == 0.0
     assert result.pit_ttm_score == 0.0
-    assert result.score == pytest.approx(SCORER.WEIGHTS["downloads"] + SCORER.WEIGHTS["index"])
+    assert result.score == pytest.approx(
+        SCORER.WEIGHTS["downloads"]
+        + SCORER.WEIGHTS["index"]
+        + SCORER.WEIGHTS["comparatives"]
+        + SCORER.WEIGHTS["restatements"]
+    )
 
 
 def test_tolerance_accepts_rounding(reference):
@@ -280,3 +336,52 @@ def test_tolerance_accepts_rounding(reference):
     ttm2 = _ttm_rows(idx, fin2)
     result = SCORER.score_submission(_bundle(idx, fin2, ttm2), downloads, ref)
     assert result.financials_score == pytest.approx(1.0)
+
+
+def test_comparatives_swapped_columns_lose_credit_and_break_log(reference):
+    ref, downloads, idx, fin, ttm = reference
+    swapped = []
+    for r in _cmp_rows():
+        r = dict(r)
+        r["prior_np_original"], r["prior_np_restated"] = (
+            r["prior_np_restated"],
+            r["prior_np_original"],
+        )
+        swapped.append(r)
+    result = SCORER.score_submission(_bundle(idx, fin, ttm, swapped), downloads, ref)
+    assert not result.component_errors
+    assert result.comparatives_score < 1.0
+    assert result.restatements_score < 1.0
+    assert result.pit_ttm_score == 1.0
+
+
+def test_fabricated_restatement_log_fails_provenance(reference):
+    ref, downloads, idx, fin, ttm = reference
+    cmp_rows = _cmp_rows()
+    fake_log = _log_rows(cmp_rows, idx)
+    fake_log.append(
+        {
+            "ticker": "000930.SZ",
+            "prior_period": "2023-09-30",
+            "first_announcement_id": "b5",
+            "first_announce_date": "2024-10-30",
+            "revenue_original": "1",
+            "revenue_restated": "2",
+            "net_profit_original": "1",
+            "net_profit_restated": "2",
+        }
+    )
+    result = SCORER.score_submission(_bundle(idx, fin, ttm, cmp_rows, fake_log), downloads, ref)
+    assert "not derivable" in result.component_errors["restatements"]
+    assert result.restatements_score == 0.0
+    assert result.comparatives_score == 1.0
+
+
+def test_missing_comparatives_zeroes_two_components(reference):
+    ref, downloads, idx, fin, ttm = reference
+    outputs = _bundle(idx, fin, ttm)
+    outputs["comparatives.csv"] = None
+    result = SCORER.score_submission(outputs, downloads, ref)
+    assert "comparatives" in result.component_errors and "restatements" in result.component_errors
+    assert result.comparatives_score == 0.0 and result.restatements_score == 0.0
+    assert result.pit_ttm_score == 1.0

@@ -32,7 +32,13 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_NAME = "business_finance"
 TASK_NAME = "ashare_pit_ttm_disclosures_01"
-OUTPUT_CSVS = ("reports_index.csv", "financials_ytd.csv", "pit_ttm.csv")
+OUTPUT_CSVS = (
+    "reports_index.csv",
+    "financials_ytd.csv",
+    "comparatives.csv",
+    "pit_ttm.csv",
+    "restatement_log.csv",
+)
 REFERENCE_FILES = (
     "file_manifest.json",
     "reports_index.csv",
@@ -135,7 +141,9 @@ Deliverables under `{self.remote_output_dir}`:
 - `downloads/<announcement_id>.PDF`: every required full-text quarterly, half-year and annual report announced 2021-10-01 to 2024-12-31, including corrected re-issues (更正后), byte-identical to the file served by cninfo
 - `reports_index.csv`: one row per downloaded report with ticker, cninfo announcement id, title, announce date, report period, report type (Q1/H1/Q3/FY), correction flag, file
 - `financials_ytd.csv`: year-to-date 营业收入 and 归属于上市公司股东的净利润 from each report's 主要会计数据 table, in CNY yuan
+- `comparatives.csv`: the prior-year same-period figures each report prints, as originally reported (调整前) and after retrospective adjustment (调整后), with a restated flag
 - `pit_ttm.csv`: for each ticker and as-of date, the trailing-twelve-month revenue and attributable net profit knowable on that date from reports announced on or before it, with the latest report used and the method
+- `restatement_log.csv`: for every prior period some later report restated, the first report that disclosed it and the original and restated figures it printed
 
 Requirements:
 - Data may come only from www.cninfo.com.cn and static.cninfo.com.cn. No third-party data providers or aggregators.
@@ -144,7 +152,8 @@ Requirements:
 - Be polite to cninfo: about one request per second.
 - Python with pandas, requests and pdfplumber is available via `{self.python_wrapper}` (first call creates a virtual environment from `{self.requirements_file}`). Any other tooling is acceptable if the outputs match the contract.
 - Do not modify files under `{self.input_dir}`.
-- The grader re-derives `pit_ttm.csv` from your own `reports_index.csv` and `financials_ytd.csv` and rejects a submission whose TTM table does not follow from them.
+- Restated comparatives appear as 调整前 / 调整后 column pairs whose order differs between issuers; read the header. Shanghai-listed Q1 and Q3 reports print no prior-year column at all.
+- The grader re-derives `pit_ttm.csv` from your own `reports_index.csv` and `financials_ytd.csv`, and `restatement_log.csv` from your own `comparatives.csv`; tables that do not follow from your own inputs score zero.
 """
 
     def to_metadata(self) -> dict:

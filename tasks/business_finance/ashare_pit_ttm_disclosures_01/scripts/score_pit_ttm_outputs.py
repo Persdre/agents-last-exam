@@ -3,17 +3,24 @@
 Four independently scored components; a missing or malformed component scores 0 on its own without
 erasing credit earned by the others:
 
-  downloads  (0.15)  share of required cninfo announcement ids present under output/downloads/ whose
+  downloads  (0.10)  share of required cninfo announcement ids present under output/downloads/ whose
                      MD5 equals the served file's
-  index      (0.10)  share of required reports whose ticker, announce date, report period, report type
+  index      (0.05)  share of required reports whose ticker, announce date, report period, report type
                      and correction flag are all correct; extra rows cost half a point each
-  financials (0.30)  share of required reports whose revenue and attributable net profit both match the
+  financials (0.20)  share of required reports whose revenue and attributable net profit both match the
                      reference within REL_TOL (or ABS_TOL yuan)
-  pit_ttm    (0.45)  share of tickers whose entire as-of series matches the reference (method, latest
+  comparatives (0.20) share of required reports whose four prior-year figures (original / restated, revenue /
+                     net profit) and restated flag match the reference
+  restatements (0.15) restatement log: matched (ticker, prior period) rows divided by max(reference rows,
+                     submitted rows); 0 when the log is not derivable from the submitted comparatives
+  pit_ttm    (0.30)  share of tickers whose entire as-of series matches the reference (method, latest
                      announcement id, both TTM values within tolerance). One wrong row makes the ticker
                      wrong, because it means the point-in-time logic is wrong. The component is 0 when
                      the table does not cover the grid or cannot be re-derived from the submitted index
                      and financials under the spec (provenance).
+
+A submission passes when the weighted score is at least PASS_THRESHOLD and every scored component is at
+least COMPONENT_FLOOR, so one wrong ticker in the TTM series or one wrong restatement row cannot pass.
 
 Admin replay fixtures (output_test_pos / output_test_neg) carry no PDFs; in fixture mode the downloads
 component is dropped and the remaining weights are renormalised.
@@ -59,11 +66,40 @@ TTM_COLUMNS = [
     "revenue_ttm_cny",
     "method",
 ]
+CMP_COLUMNS = [
+    "ticker",
+    "report_period",
+    "announcement_id",
+    "prior_period",
+    "prior_revenue_original",
+    "prior_revenue_restated",
+    "prior_np_original",
+    "prior_np_restated",
+    "restated",
+]
+LOG_COLUMNS = [
+    "ticker",
+    "prior_period",
+    "first_announcement_id",
+    "first_announce_date",
+    "revenue_original",
+    "revenue_restated",
+    "net_profit_original",
+    "net_profit_restated",
+]
 REL_TOL = 0.005
 ABS_TOL = 1.0
 PASS_THRESHOLD = 0.97
+COMPONENT_FLOOR = 0.95
 PROVENANCE_REL_TOL = 0.001
-WEIGHTS = {"downloads": 0.15, "index": 0.10, "financials": 0.30, "pit_ttm": 0.45}
+WEIGHTS = {
+    "downloads": 0.10,
+    "index": 0.05,
+    "financials": 0.20,
+    "comparatives": 0.20,
+    "pit_ttm": 0.30,
+    "restatements": 0.15,
+}
 FIXTURE_DIR_NAMES = {"output_test_pos", "output_test_neg"}
 _DATE_RE = re.compile(r"^(\d{4})[-/.年]?(\d{1,2})[-/.月]?(\d{1,2})日?$")
 
@@ -78,6 +114,12 @@ class ScoreResult:
     index_score: float = 0.0
     financials_score: float = 0.0
     pit_ttm_score: float = 0.0
+    comparatives_score: float = 0.0
+    restatements_score: float = 0.0
+    n_comparatives_ok: int = 0
+    n_log_rows_ref: int = 0
+    n_log_rows_ok: int = 0
+    n_log_rows_extra: int = 0
     component_errors: dict[str, str] = field(default_factory=dict)
     n_required_reports: int = 0
     n_downloads_ok: int = 0
@@ -180,6 +222,13 @@ def parse_csv(
             rec["report_type"] = rec["report_type"].upper()
         if "is_correction" in rec:
             rec["is_correction"] = norm_flag(rec["is_correction"])
+        if "restated" in rec:
+            rec["restated"] = norm_flag(rec["restated"])
+        if "first_announcement_id" in rec:
+            rec["first_announcement_id"] = norm_id(rec["first_announcement_id"])
+        for key in ("prior_period", "first_announce_date"):
+            if key in rec:
+                rec[key] = norm_date(rec[key])
         if "method" in rec:
             rec["method"] = rec["method"].lower()
         rows.append(rec)
@@ -371,6 +420,109 @@ def _score_pit_ttm(
     return (len(tickers) - len(wrong)) / len(tickers), rows_ok, sorted(wrong), [], None
 
 
+def _score_comparatives(cmp_rows: list[dict], ref_cmp: list[dict]) -> tuple[float, int]:
+    ref_by_id = {r["announcement_id"]: r for r in ref_cmp}
+    sub_by_id = {r["announcement_id"]: r for r in cmp_rows}
+    ok = 0
+    for aid, ref in ref_by_id.items():
+        s = sub_by_id.get(aid)
+        if not s:
+            continue
+        cells_ok = all(
+            _close(_num(s[c]), _num(ref[c]))
+            for c in (
+                "prior_revenue_original",
+                "prior_revenue_restated",
+                "prior_np_original",
+                "prior_np_restated",
+            )
+        )
+        if (
+            cells_ok
+            and s["restated"] == ref["restated"]
+            and s["prior_period"] == ref["prior_period"]
+        ):
+            ok += 1
+    return ok / len(ref_by_id), ok
+
+
+def derive_restatement_log(
+    cmp_rows: list[dict], index_rows: list[dict]
+) -> dict[tuple[str, str], dict]:
+    """First report (earliest announce date, then smallest id) whose comparatives flag a restatement per (ticker, prior_period)."""
+    date_by_id = {r["announcement_id"]: r["announce_date"] for r in index_rows}
+    out: dict[tuple[str, str], dict] = {}
+    for r in sorted(
+        cmp_rows,
+        key=lambda r: (date_by_id.get(r["announcement_id"], "9999-99-99"), r["announcement_id"]),
+    ):
+        if r["restated"] != "1":
+            continue
+        key = (r["ticker"], r["prior_period"])
+        if key in out:
+            continue
+        out[key] = {
+            "first_announcement_id": r["announcement_id"],
+            "first_announce_date": date_by_id.get(r["announcement_id"], ""),
+            "revenue_original": r["prior_revenue_original"],
+            "revenue_restated": r["prior_revenue_restated"],
+            "net_profit_original": r["prior_np_original"],
+            "net_profit_restated": r["prior_np_restated"],
+        }
+    return out
+
+
+def _log_row_matches(sub: dict, ref: dict) -> bool:
+    return (
+        sub["first_announcement_id"] == ref["first_announcement_id"]
+        and sub["first_announce_date"] == ref["first_announce_date"]
+        and all(
+            _close(_num(sub[c]), _num(ref[c]))
+            for c in (
+                "revenue_original",
+                "revenue_restated",
+                "net_profit_original",
+                "net_profit_restated",
+            )
+        )
+    )
+
+
+def _score_restatements(
+    log_rows: list[dict],
+    cmp_rows: list[dict] | None,
+    index_rows: list[dict] | None,
+    ref_log: list[dict],
+) -> tuple[float, int, int, str | None]:
+    """F1-style credit over (ticker, prior_period) rows: matched / max(len(ref), len(sub)). Provenance against the submitted comparatives."""
+    sub_by_key = {(r["ticker"], r["prior_period"]): r for r in log_rows}
+    if len(sub_by_key) != len(log_rows):
+        return 0.0, 0, 0, "restatement_log.csv has duplicate (ticker, prior_period) rows"
+    if cmp_rows is None or index_rows is None:
+        return (
+            0.0,
+            0,
+            0,
+            "restatement_log.csv cannot be verified without valid comparatives.csv and reports_index.csv",
+        )
+    derived = derive_restatement_log(cmp_rows, index_rows)
+    if set(derived) != set(sub_by_key) or any(
+        not _log_row_matches(sub_by_key[k], derived[k]) for k in derived
+    ):
+        return 0.0, 0, 0, "restatement_log.csv is not derivable from the submitted comparatives.csv"
+    ref_by_key = {(r["ticker"], r["prior_period"]): r for r in ref_log}
+    ok = sum(
+        1
+        for k, ref in ref_by_key.items()
+        if k in sub_by_key and _log_row_matches(sub_by_key[k], ref)
+    )
+    extra = len(set(sub_by_key) - set(ref_by_key))
+    if not ref_by_key and not sub_by_key:
+        return 1.0, 0, 0, None
+    denom = max(len(ref_by_key), len(sub_by_key))
+    return ok / denom, ok, extra, None
+
+
 # ----------------------------------------------------------------------------- entry point
 
 
@@ -399,7 +551,13 @@ def score_submission(
         reference.get("financials_ytd.csv"), FIN_COLUMNS, "reference financials_ytd.csv"
     )
     ref_ttm, err_t = parse_csv(reference.get("pit_ttm.csv"), TTM_COLUMNS, "reference pit_ttm.csv")
-    for err in (err_i, err_f, err_t):
+    ref_cmp, err_c = parse_csv(
+        reference.get("comparatives.csv"), CMP_COLUMNS, "reference comparatives.csv"
+    )
+    ref_log, err_l = parse_csv(
+        reference.get("restatement_log.csv"), LOG_COLUMNS, "reference restatement_log.csv"
+    )
+    for err in (err_i, err_f, err_t, err_c, err_l):
         if err:
             raise RuntimeError(err)
     if (
@@ -426,6 +584,16 @@ def score_submission(
     ttm_rows, err = parse_csv(outputs.get("pit_ttm.csv"), TTM_COLUMNS, "output/pit_ttm.csv")
     if err:
         errors["pit_ttm"] = err
+    cmp_rows, err = parse_csv(
+        outputs.get("comparatives.csv"), CMP_COLUMNS, "output/comparatives.csv"
+    )
+    if err:
+        errors["comparatives"] = err
+    log_rows, err = parse_csv(
+        outputs.get("restatement_log.csv"), LOG_COLUMNS, "output/restatement_log.csv"
+    )
+    if err:
+        errors["restatements"] = err
 
     result = ScoreResult(
         0.0,
@@ -459,6 +627,14 @@ def score_submission(
         result.tickers_ttm_ok = len(tickers) - len(wrong)
         if err:
             errors["pit_ttm"] = err
+    if cmp_rows is not None:
+        result.comparatives_score, result.n_comparatives_ok = _score_comparatives(cmp_rows, ref_cmp)
+    result.n_log_rows_ref = len(ref_log)
+    if log_rows is not None:
+        score, ok, extra, err = _score_restatements(log_rows, cmp_rows, index_rows, ref_log)
+        result.restatements_score, result.n_log_rows_ok, result.n_log_rows_extra = score, ok, extra
+        if err:
+            errors["restatements"] = err
 
     weights = dict(WEIGHTS)
     if fixture_mode:
@@ -468,9 +644,14 @@ def score_submission(
     result.score = max(
         0.0, min(1.0, sum(weights[k] * getattr(result, f"{k}_score") for k in weights))
     )
-    result.passed = result.score >= PASS_THRESHOLD
+    scored_components = [k for k in weights]
+    result.passed = result.score >= PASS_THRESHOLD and all(
+        getattr(result, f"{k}_score") >= COMPONENT_FLOOR for k in scored_components
+    )
     result.component_errors = errors
-    if errors and all(k in errors for k in ("index", "financials", "pit_ttm")):
+    if errors and all(
+        k in errors for k in ("index", "financials", "pit_ttm", "comparatives", "restatements")
+    ):
         result.reason = "no scorable output"
     elif errors:
         result.reason = "scored with component errors: " + "; ".join(
@@ -503,7 +684,13 @@ if __name__ == "__main__":
     out, ref = Path(a.output_dir), Path(a.reference_dir)
     outputs = {
         n: (out / n).read_bytes() if (out / n).is_file() else None
-        for n in ("reports_index.csv", "financials_ytd.csv", "pit_ttm.csv")
+        for n in (
+            "reports_index.csv",
+            "financials_ytd.csv",
+            "comparatives.csv",
+            "pit_ttm.csv",
+            "restatement_log.csv",
+        )
     }
     reference = {
         n: (ref / n).read_bytes()
@@ -511,7 +698,9 @@ if __name__ == "__main__":
             "file_manifest.json",
             "reports_index.csv",
             "financials_ytd.csv",
+            "comparatives.csv",
             "pit_ttm.csv",
+            "restatement_log.csv",
             "grid.json",
         )
     }
