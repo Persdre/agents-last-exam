@@ -42,7 +42,14 @@ REFERENCE_FILES = (
 )
 
 VARIANTS = [
-    ("base", "12 companies, announcements 2021-10-01 to 2024-12-31, 8 quarter-end as-of dates."),
+    (
+        "base",
+        "12 companies, 161 reports (5 corrected re-issues), announcements 2021-10-01 to 2024-12-31, 8 as-of dates.",
+    ),
+    (
+        "variant_2",
+        "12 different companies, 172 reports (16 corrected re-issues, one 2023 IPO, two 百万元 reporters), same rules.",
+    ),
 ]
 
 
