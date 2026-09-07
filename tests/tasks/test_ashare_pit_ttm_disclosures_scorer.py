@@ -141,16 +141,32 @@ def test_derivation_follows_point_in_time_rules():
 def test_exact_reference_scores_one(reference):
     ref, downloads, idx, fin, ttm = reference
     result = SCORER.score_submission(_bundle(idx, fin, ttm), downloads, ref)
-    assert result.hard_gate is None
+    assert not result.component_errors
     assert result.score == pytest.approx(1.0)
     assert result.passed
 
 
-def test_missing_file_is_gate(reference):
+def test_missing_ttm_file_zeroes_only_that_component(reference):
     ref, downloads, idx, fin, ttm = reference
     outputs = _bundle(idx, fin, ttm)
     outputs["pit_ttm.csv"] = None
-    assert SCORER.score_submission(outputs, downloads, ref).hard_gate == "pit_ttm_schema"
+    result = SCORER.score_submission(outputs, downloads, ref)
+    assert "pit_ttm" in result.component_errors
+    assert result.pit_ttm_score == 0.0
+    assert (
+        result.downloads_score == 1.0
+        and result.index_score == 1.0
+        and result.financials_score == 1.0
+    )
+    assert result.score == pytest.approx(1.0 - SCORER.WEIGHTS["pit_ttm"])
+    assert not result.passed
+
+
+def test_everything_missing_scores_zero(reference):
+    ref, _downloads, _idx, _fin, _ttm = reference
+    result = SCORER.score_submission({}, {}, ref)
+    assert result.score == 0.0
+    assert result.reason == "no scorable output"
 
 
 def test_fabricated_ttm_fails_provenance(reference):
@@ -158,7 +174,71 @@ def test_fabricated_ttm_fails_provenance(reference):
     fake = [dict(r) for r in ttm]
     fake[0]["net_profit_attr_ttm_cny"] = "999999.00"
     result = SCORER.score_submission(_bundle(idx, fin, fake), downloads, ref)
-    assert result.hard_gate == "pit_ttm_provenance"
+    assert "not derivable" in result.component_errors["pit_ttm"]
+    assert result.pit_ttm_score == 0.0
+    assert result.provenance_mismatches == [f"{fake[0]['ticker']}@{fake[0]['as_of_date']}"]
+    assert result.financials_score == 1.0
+
+
+def test_fixture_mode_drops_downloads_component(reference):
+    ref, _downloads, idx, fin, ttm = reference
+    result = SCORER.score_submission(_bundle(idx, fin, ttm), {}, ref, fixture_mode=True)
+    assert result.fixture_mode
+    assert result.score == pytest.approx(1.0)
+    assert result.passed
+    assert SCORER.is_fixture_dir(
+        "/media/user/data/agenthle/business_finance/x/base/output_test_pos"
+    )
+    assert not SCORER.is_fixture_dir("/media/user/data/agenthle/business_finance/x/base/output")
+
+
+def test_normalisation_of_ids_dates_and_flags(reference):
+    ref, downloads, idx, fin, ttm = reference
+    idx2 = [
+        dict(
+            r,
+            announce_date=r["announce_date"].replace("-", "/"),
+            report_type=r["report_type"].lower(),
+            is_correction="True" if r["is_correction"] == "1" else "False",
+            ticker=r["ticker"].lower(),
+        )
+        for r in idx
+    ]
+    fin2 = [
+        dict(r, announce_date=r["announce_date"].replace("-", "/"), ticker=r["ticker"].lower())
+        for r in fin
+    ]
+    ttm2 = [
+        dict(
+            r,
+            as_of_date=r["as_of_date"].replace("-", "/"),
+            method=r["method"].upper(),
+            ticker=r["ticker"].lower(),
+        )
+        for r in ttm
+    ]
+    result = SCORER.score_submission(_bundle(idx2, fin2, ttm2), downloads, ref)
+    assert result.score == pytest.approx(1.0)
+    assert SCORER.norm_id("1219306493.0") == "1219306493"
+    assert SCORER.norm_id(" 1219306493 ") == "1219306493"
+    assert SCORER.norm_date("2024/3/5") == "2024-03-05"
+    assert SCORER.norm_date("2024年03月05日") == "2024-03-05"
+
+
+def test_bom_and_crlf_are_accepted(reference):
+    ref, downloads, idx, fin, ttm = reference
+    outputs = _bundle(idx, fin, ttm)
+    outputs = {k: b"\xef\xbb\xbf" + v.replace(b"\n", b"\r\n") for k, v in outputs.items()}
+    result = SCORER.score_submission(outputs, downloads, ref)
+    assert result.score == pytest.approx(1.0)
+
+
+def test_reference_problems_raise_not_zero(reference):
+    ref, downloads, idx, fin, ttm = reference
+    broken = dict(ref)
+    broken["grid.json"] = b"not json"
+    with pytest.raises(RuntimeError):
+        SCORER.score_submission(_bundle(idx, fin, ttm), downloads, broken)
 
 
 def test_ignoring_correction_loses_ttm_credit_only_where_it_bites(reference):
@@ -168,9 +248,9 @@ def test_ignoring_correction_loses_ttm_credit_only_where_it_bites(reference):
     ttm2 = _ttm_rows(idx2, fin2)
     dl2 = {k: v for k, v in downloads.items() if k != "b6"}
     result = SCORER.score_submission(_bundle(idx2, fin2, ttm2), dl2, ref)
-    assert result.hard_gate is None
+    assert not result.component_errors
     assert result.n_downloads_ok == len(REPORTS) - 1
-    assert result.n_ttm_ok == len(TICKERS) * len(AS_OF) - 1
+    assert result.n_ttm_rows_ok == len(TICKERS) * len(AS_OF) - 1
     assert result.tickers_ttm_wrong == ["000930.SZ"]
     assert result.pit_ttm_score == pytest.approx(0.5)
     assert not result.passed
@@ -188,7 +268,7 @@ def test_wrong_unit_zeroes_financials_and_ttm(reference):
     ]
     ttm2 = _ttm_rows(idx, fin2)
     result = SCORER.score_submission(_bundle(idx, fin2, ttm2), downloads, ref)
-    assert result.hard_gate is None
+    assert not result.component_errors
     assert result.financials_score == 0.0
     assert result.pit_ttm_score == 0.0
     assert result.score == pytest.approx(SCORER.WEIGHTS["downloads"] + SCORER.WEIGHTS["index"])

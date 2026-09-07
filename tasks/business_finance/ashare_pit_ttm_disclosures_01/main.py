@@ -26,7 +26,7 @@ SCRIPTS_DIR = Path(__file__).parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from score_pit_ttm_outputs import score_submission
+from score_pit_ttm_outputs import is_fixture_dir, score_submission
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,22 @@ class TaskConfig(LinuxTaskConfig):
     @property
     def python_wrapper(self) -> str:
         return f"{self.software_dir}/python.sh"
+
+    @property
+    def output_test_pos_dir(self) -> str:
+        return f"{self.task_dir}/output_test_pos"
+
+    @property
+    def output_test_neg_dir(self) -> str:
+        return f"{self.task_dir}/output_test_neg"
+
+    @property
+    def remote_output_dir(self) -> str:
+        if self.REMOTE_OUTPUT_DIR == "output_test_pos":
+            return self.output_test_pos_dir
+        if self.REMOTE_OUTPUT_DIR == "output_test_neg":
+            return self.output_test_neg_dir
+        return f"{self.task_dir}/{self.REMOTE_OUTPUT_DIR}"
 
     @property
     def downloads_dir(self) -> str:
@@ -136,6 +152,8 @@ Requirements:
                 "requirements_file": self.requirements_file,
                 "python_wrapper": self.python_wrapper,
                 "downloads_dir": self.downloads_dir,
+                "output_test_pos_dir": self.output_test_pos_dir,
+                "output_test_neg_dir": self.output_test_neg_dir,
                 "output_files": self.output_files,
                 "reference_files": self.reference_files,
             }
@@ -167,9 +185,12 @@ async def start(task_cfg, session: cb.DesktopSession):
     await _setup(task_cfg, session)
     meta = task_cfg.metadata
     out_dir = meta["remote_output_dir"]
-    await session.run_command(
-        f"rm -rf {out_dir!r} && mkdir -p {meta['downloads_dir']!r}", check=False
-    )
+    if is_fixture_dir(out_dir):
+        logger.info("[%s] replay fixture mode, leaving %s untouched", meta["variant_name"], out_dir)
+    else:
+        await session.run_command(
+            f"rm -rf {out_dir!r} && mkdir -p {meta['downloads_dir']!r}", check=False
+        )
     await session.run_command(f"chmod +x {meta['python_wrapper']!r}", check=False)
     for path in (
         meta["spec_file"],
@@ -218,10 +239,11 @@ async def evaluate(task_cfg, session: cb.DesktopSession) -> list[float]:
     outputs: dict[str, bytes | None] = {}
     for name, path in meta["output_files"].items():
         outputs[name] = await session.read_bytes(path) if await _exists(session, path) else None
-    downloaded = await _downloaded_md5s(session, meta["downloads_dir"])
+    fixture_mode = is_fixture_dir(meta["remote_output_dir"])
+    downloaded = {} if fixture_mode else await _downloaded_md5s(session, meta["downloads_dir"])
 
     try:
-        result = score_submission(outputs, downloaded, reference)
+        result = score_submission(outputs, downloaded, reference, fixture_mode=fixture_mode)
     except RuntimeError:
         raise
     except Exception:

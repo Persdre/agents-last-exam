@@ -1,21 +1,33 @@
 """Host-side scorer for business_finance/ashare_pit_ttm_disclosures_01. Standard library only.
 
-Gate-and-score:
-  gates (score 0): the three CSVs exist and parse with the exact columns; pit_ttm covers exactly the
-  (ticker, as_of_date) grid; provenance: every pit_ttm row must be reproducible from the submitted
-  financials_ytd.csv and reports_index.csv under the spec (the grader re-derives it).
-  score = 0.15 * downloads + 0.10 * index + 0.30 * financials + 0.45 * pit_ttm
-  downloads / index / financials are per-report shares; pit_ttm is the share of TICKERS whose whole
-  as-of series (every row) is correct, because one wrong row means the point-in-time logic is wrong.
+Four independently scored components; a missing or malformed component scores 0 on its own without
+erasing credit earned by the others:
+
+  downloads  (0.15)  share of required cninfo announcement ids present under output/downloads/ whose
+                     MD5 equals the served file's
+  index      (0.10)  share of required reports whose ticker, announce date, report period, report type
+                     and correction flag are all correct; extra rows cost half a point each
+  financials (0.30)  share of required reports whose revenue and attributable net profit both match the
+                     reference within REL_TOL (or ABS_TOL yuan)
+  pit_ttm    (0.45)  share of tickers whose entire as-of series matches the reference (method, latest
+                     announcement id, both TTM values within tolerance). One wrong row makes the ticker
+                     wrong, because it means the point-in-time logic is wrong. The component is 0 when
+                     the table does not cover the grid or cannot be re-derived from the submitted index
+                     and financials under the spec (provenance).
+
+Admin replay fixtures (output_test_pos / output_test_neg) carry no PDFs; in fixture mode the downloads
+component is dropped and the remaining weights are renormalised.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -50,8 +62,10 @@ TTM_COLUMNS = [
 REL_TOL = 0.005
 ABS_TOL = 1.0
 PASS_THRESHOLD = 0.97
+PROVENANCE_REL_TOL = 0.001
 WEIGHTS = {"downloads": 0.15, "index": 0.10, "financials": 0.30, "pit_ttm": 0.45}
-PERIOD_TYPE = {"03-31": "Q1", "06-30": "H1", "09-30": "Q3", "12-31": "FY"}
+FIXTURE_DIR_NAMES = {"output_test_pos", "output_test_neg"}
+_DATE_RE = re.compile(r"^(\d{4})[-/.年]?(\d{1,2})[-/.月]?(\d{1,2})日?$")
 
 
 @dataclass
@@ -59,34 +73,80 @@ class ScoreResult:
     score: float
     passed: bool
     reason: str
-    hard_gate: str | None = None
+    fixture_mode: bool = False
     downloads_score: float = 0.0
     index_score: float = 0.0
     financials_score: float = 0.0
     pit_ttm_score: float = 0.0
+    component_errors: dict[str, str] = field(default_factory=dict)
     n_required_reports: int = 0
     n_downloads_ok: int = 0
     n_index_ok: int = 0
+    n_index_extra: int = 0
     n_financials_ok: int = 0
-    n_ttm_ok: int = 0
+    n_ttm_rows_ok: int = 0
     n_ttm_rows: int = 0
     tickers_ttm_ok: int = 0
     tickers_total: int = 0
     tickers_ttm_wrong: list[str] = field(default_factory=list)
-    tickers_ttm_ok: int = 0
-    tickers_total: int = 0
-    tickers_ttm_wrong: list[str] = field(default_factory=list)
     provenance_mismatches: list[str] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
+# ----------------------------------------------------------------------------- normalisation
+
+
 def _as_text(payload: str | bytes) -> str:
     if isinstance(payload, bytes):
-        return payload.decode("utf-8-sig")
+        return payload.decode("utf-8-sig", errors="replace")
     return payload.lstrip("﻿")
+
+
+def norm_id(cell: str) -> str:
+    """Announcement ids arrive as '1219306493', '1219306493.0' or ' 1219306493 '."""
+    s = (cell or "").strip()
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
+
+
+def norm_date(cell: str) -> str:
+    s = (cell or "").strip()
+    m = _DATE_RE.match(s)
+    if not m:
+        return s
+    return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def norm_ticker(cell: str) -> str:
+    return (cell or "").strip().upper()
+
+
+def norm_flag(cell: str) -> str:
+    s = (cell or "").strip().lower()
+    if s in {"1", "1.0", "true", "yes", "y"}:
+        return "1"
+    if s in {"0", "0.0", "false", "no", "n", ""}:
+        return "0"
+    return s
+
+
+def _num(cell: str) -> float:
+    s = (cell or "").strip().replace(",", "")
+    if s == "" or s.lower() in {"nan", "na", "none", "null"}:
+        return math.nan
+    try:
+        return float(s)
+    except ValueError:
+        return math.nan
+
+
+def _close(a: float, b: float, rel: float = REL_TOL) -> bool:
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    return abs(a - b) <= max(ABS_TOL, rel * abs(b))
 
 
 def parse_csv(
@@ -96,7 +156,7 @@ def parse_csv(
         return None, f"missing {label}"
     reader = csv.reader(io.StringIO(_as_text(payload)))
     try:
-        header = [h.strip() for h in next(reader)]
+        header = [h.strip().lstrip("﻿") for h in next(reader)]
     except StopIteration:
         return None, f"{label} is empty"
     if header != columns:
@@ -107,21 +167,26 @@ def parse_csv(
             continue
         if len(row) != len(columns):
             return None, f"{label} line {line_no} has {len(row)} cells, expected {len(columns)}"
-        rows.append({c: v.strip() for c, v in zip(columns, row)})
+        rec = {c: v.strip() for c, v in zip(columns, row)}
+        if "ticker" in rec:
+            rec["ticker"] = norm_ticker(rec["ticker"])
+        for key in ("announcement_id", "latest_announcement_id"):
+            if key in rec:
+                rec[key] = norm_id(rec[key])
+        for key in ("announce_date", "report_period", "as_of_date", "latest_report_period"):
+            if key in rec:
+                rec[key] = norm_date(rec[key])
+        if "report_type" in rec:
+            rec["report_type"] = rec["report_type"].upper()
+        if "is_correction" in rec:
+            rec["is_correction"] = norm_flag(rec["is_correction"])
+        if "method" in rec:
+            rec["method"] = rec["method"].lower()
+        rows.append(rec)
     return rows, None
 
 
-def _num(cell: str) -> float:
-    cell = (cell or "").strip().replace(",", "")
-    if cell == "" or cell.lower() in {"nan", "na", "none", "null"}:
-        return math.nan
-    return float(cell)
-
-
-def _close(a: float, b: float) -> bool:
-    if math.isnan(a) or math.isnan(b):
-        return math.isnan(a) and math.isnan(b)
-    return abs(a - b) <= max(ABS_TOL, REL_TOL * abs(b))
+# ----------------------------------------------------------------------------- point-in-time derivation
 
 
 def _figure(kept: dict[str, dict], fin_by_id: dict, ticker: str, period: str, col: str) -> float:
@@ -191,85 +256,23 @@ def derive_pit_ttm(
     return out
 
 
-def score_submission(
-    outputs: dict[str, bytes | None],
-    downloaded: dict[str, str],
-    reference: dict[str, bytes],
-) -> ScoreResult:
-    """outputs: {'reports_index.csv','financials_ytd.csv','pit_ttm.csv'} -> bytes or None.
-    downloaded: {announcement_id: md5} of files present under output/downloads/.
-    reference: {'file_manifest.json','reports_index.csv','financials_ytd.csv','pit_ttm.csv','grid.json'} -> bytes."""
-    manifest = json.loads(_as_text(reference["file_manifest.json"]))
-    grid = json.loads(_as_text(reference["grid.json"]))
-    ref_index, err = parse_csv(reference["reports_index.csv"], INDEX_COLUMNS, "reference index")
-    if err:
-        raise RuntimeError(err)
-    ref_fin, err = parse_csv(reference["financials_ytd.csv"], FIN_COLUMNS, "reference financials")
-    if err:
-        raise RuntimeError(err)
-    ref_ttm, err = parse_csv(reference["pit_ttm.csv"], TTM_COLUMNS, "reference pit_ttm")
-    if err:
-        raise RuntimeError(err)
+# ----------------------------------------------------------------------------- components
 
-    index_rows, err = parse_csv(
-        outputs.get("reports_index.csv"), INDEX_COLUMNS, "output/reports_index.csv"
+
+def _score_downloads(downloaded: dict[str, str], manifest: dict) -> tuple[float, int]:
+    normalized = {norm_id(k): v.strip().lower() for k, v in downloaded.items()}
+    ok = sum(
+        1 for aid, meta in manifest.items() if normalized.get(norm_id(aid)) == meta["md5"].lower()
     )
-    if err:
-        return ScoreResult(0.0, False, err, hard_gate="index_schema")
-    fin_rows, err = parse_csv(
-        outputs.get("financials_ytd.csv"), FIN_COLUMNS, "output/financials_ytd.csv"
-    )
-    if err:
-        return ScoreResult(0.0, False, err, hard_gate="financials_schema")
-    ttm_rows, err = parse_csv(outputs.get("pit_ttm.csv"), TTM_COLUMNS, "output/pit_ttm.csv")
-    if err:
-        return ScoreResult(0.0, False, err, hard_gate="pit_ttm_schema")
+    return ok / len(manifest), ok
 
-    tickers, as_of_dates = grid["tickers"], grid["as_of_dates"]
-    ttm_keys = [(r["ticker"], r["as_of_date"]) for r in ttm_rows]
-    expected_keys = [(t, d) for t in tickers for d in as_of_dates]
-    if sorted(ttm_keys) != sorted(expected_keys):
-        return ScoreResult(
-            0.0,
-            False,
-            "pit_ttm.csv must contain exactly one row per (ticker, as_of_date) of the grid",
-            hard_gate="pit_ttm_grid",
-        )
 
-    derived = derive_pit_ttm(index_rows, fin_rows, tickers, as_of_dates)
-    mismatches = []
-    for r in ttm_rows:
-        d = derived[(r["ticker"], r["as_of_date"])]
-        ok = (
-            r["method"] == d["method"]
-            and r["latest_announcement_id"] == d["latest_announcement_id"]
-            and _close(_num(r["net_profit_attr_ttm_cny"]), d["net_profit_attr_ttm_cny"])
-            and _close(_num(r["revenue_ttm_cny"]), d["revenue_ttm_cny"])
-        )
-        if not ok:
-            mismatches.append(f"{r['ticker']}@{r['as_of_date']}")
-    if mismatches:
-        return ScoreResult(
-            0.0,
-            False,
-            f"pit_ttm.csv is not derivable from the submitted index and financials ({len(mismatches)} rows)",
-            hard_gate="pit_ttm_provenance",
-            provenance_mismatches=mismatches[:20],
-        )
-
-    required_ids = set(manifest)
-    n_dl_ok = sum(
-        1
-        for aid, md5 in downloaded.items()
-        if aid in manifest and manifest[aid]["md5"].lower() == md5.lower()
-    )
-    downloads_score = n_dl_ok / len(required_ids)
-
-    ref_index_by_id = {r["announcement_id"]: r for r in ref_index}
-    sub_index_by_id = {r["announcement_id"]: r for r in index_rows}
-    n_index_ok = 0
-    for aid, ref in ref_index_by_id.items():
-        s = sub_index_by_id.get(aid)
+def _score_index(index_rows: list[dict], ref_index: list[dict]) -> tuple[float, int, int]:
+    ref_by_id = {r["announcement_id"]: r for r in ref_index}
+    sub_by_id = {r["announcement_id"]: r for r in index_rows}
+    ok = 0
+    for aid, ref in ref_by_id.items():
+        s = sub_by_id.get(aid)
         if (
             s
             and s["ticker"] == ref["ticker"]
@@ -278,70 +281,209 @@ def score_submission(
             and s["report_type"] == ref["report_type"]
             and s["is_correction"] == ref["is_correction"]
         ):
-            n_index_ok += 1
-    extra = len(set(sub_index_by_id) - set(ref_index_by_id))
-    index_score = max(0.0, (n_index_ok - 0.5 * extra) / len(ref_index_by_id))
+            ok += 1
+    extra = len(set(sub_by_id) - set(ref_by_id))
+    return max(0.0, (ok - 0.5 * extra) / len(ref_by_id)), ok, extra
 
-    ref_fin_by_id = {r["announcement_id"]: r for r in ref_fin}
-    sub_fin_by_id = {r["announcement_id"]: r for r in fin_rows}
-    n_fin_ok = 0
-    for aid, ref in ref_fin_by_id.items():
-        s = sub_fin_by_id.get(aid)
+
+def _score_financials(fin_rows: list[dict], ref_fin: list[dict]) -> tuple[float, int]:
+    ref_by_id = {r["announcement_id"]: r for r in ref_fin}
+    sub_by_id = {r["announcement_id"]: r for r in fin_rows}
+    ok = 0
+    for aid, ref in ref_by_id.items():
+        s = sub_by_id.get(aid)
         if (
             s
             and _close(_num(s["revenue_ytd_cny"]), _num(ref["revenue_ytd_cny"]))
             and _close(_num(s["net_profit_attr_ytd_cny"]), _num(ref["net_profit_attr_ytd_cny"]))
         ):
-            n_fin_ok += 1
-    financials_score = n_fin_ok / len(ref_fin_by_id)
+            ok += 1
+    return ok / len(ref_by_id), ok
 
-    ref_ttm_by_key = {(r["ticker"], r["as_of_date"]): r for r in ref_ttm}
-    n_ttm_ok = 0
-    wrong_tickers: set[str] = set()
+
+def _ttm_row_matches(sub: dict, ref: dict, rel: float = REL_TOL) -> bool:
+    return (
+        sub["method"] == ref["method"]
+        and sub["latest_announcement_id"] == ref["latest_announcement_id"]
+        and _close(_num(sub["net_profit_attr_ttm_cny"]), _num(ref["net_profit_attr_ttm_cny"]), rel)
+        and _close(_num(sub["revenue_ttm_cny"]), _num(ref["revenue_ttm_cny"]), rel)
+    )
+
+
+def _score_pit_ttm(
+    ttm_rows: list[dict],
+    index_rows: list[dict] | None,
+    fin_rows: list[dict] | None,
+    ref_ttm: list[dict],
+    tickers: list[str],
+    as_of_dates: list[str],
+) -> tuple[float, int, list[str], list[str], str | None]:
+    """Return (score, rows_ok, wrong_tickers, provenance_mismatches, error)."""
+    expected = {(t, d) for t in tickers for d in as_of_dates}
+    keys = [(r["ticker"], r["as_of_date"]) for r in ttm_rows]
+    if sorted(keys) != sorted(expected):
+        return (
+            0.0,
+            0,
+            sorted(tickers),
+            [],
+            "pit_ttm.csv must contain exactly one row per (ticker, as_of_date) of the grid",
+        )
+    if index_rows is None or fin_rows is None:
+        return (
+            0.0,
+            0,
+            sorted(tickers),
+            [],
+            "pit_ttm.csv cannot be verified without a valid reports_index.csv and financials_ytd.csv",
+        )
+    derived = derive_pit_ttm(index_rows, fin_rows, tickers, as_of_dates)
+    mismatches = []
     for r in ttm_rows:
-        ref = ref_ttm_by_key[(r["ticker"], r["as_of_date"])]
-        if (
-            r["method"] == ref["method"]
-            and r["latest_announcement_id"] == ref["latest_announcement_id"]
-            and _close(_num(r["net_profit_attr_ttm_cny"]), _num(ref["net_profit_attr_ttm_cny"]))
-            and _close(_num(r["revenue_ttm_cny"]), _num(ref["revenue_ttm_cny"]))
-        ):
-            n_ttm_ok += 1
+        d = derived[(r["ticker"], r["as_of_date"])]
+        d_str = {
+            **d,
+            "net_profit_attr_ttm_cny": ""
+            if math.isnan(d["net_profit_attr_ttm_cny"])
+            else repr(d["net_profit_attr_ttm_cny"]),
+            "revenue_ttm_cny": ""
+            if math.isnan(d["revenue_ttm_cny"])
+            else repr(d["revenue_ttm_cny"]),
+        }
+        if not _ttm_row_matches(r, d_str, PROVENANCE_REL_TOL):
+            mismatches.append(f"{r['ticker']}@{r['as_of_date']}")
+    if mismatches:
+        return (
+            0.0,
+            0,
+            sorted(tickers),
+            mismatches[:24],
+            f"pit_ttm.csv is not derivable from the submitted index and financials ({len(mismatches)} rows differ)",
+        )
+    ref_by_key = {(r["ticker"], r["as_of_date"]): r for r in ref_ttm}
+    rows_ok = 0
+    wrong: set[str] = set()
+    for r in ttm_rows:
+        if _ttm_row_matches(r, ref_by_key[(r["ticker"], r["as_of_date"])]):
+            rows_ok += 1
         else:
-            wrong_tickers.add(r["ticker"])
-    tickers_ttm_ok = len(tickers) - len(wrong_tickers)
-    pit_ttm_score = tickers_ttm_ok / len(tickers)
+            wrong.add(r["ticker"])
+    return (len(tickers) - len(wrong)) / len(tickers), rows_ok, sorted(wrong), [], None
 
-    score = (
-        WEIGHTS["downloads"] * downloads_score
-        + WEIGHTS["index"] * index_score
-        + WEIGHTS["financials"] * financials_score
-        + WEIGHTS["pit_ttm"] * pit_ttm_score
+
+# ----------------------------------------------------------------------------- entry point
+
+
+def score_submission(
+    outputs: dict[str, bytes | None],
+    downloaded: dict[str, str],
+    reference: dict[str, bytes],
+    *,
+    fixture_mode: bool = False,
+) -> ScoreResult:
+    """outputs: {'reports_index.csv','financials_ytd.csv','pit_ttm.csv'} -> bytes or None (missing).
+    downloaded: {announcement_id: md5} of files present under output/downloads/ (ignored in fixture mode).
+    reference: {'file_manifest.json','reports_index.csv','financials_ytd.csv','pit_ttm.csv','grid.json'} -> bytes.
+    Raises RuntimeError only when the reference itself is unusable (infrastructure), never on agent output."""
+    try:
+        manifest = json.loads(_as_text(reference["file_manifest.json"]))
+        grid = json.loads(_as_text(reference["grid.json"]))
+        tickers = [norm_ticker(t) for t in grid["tickers"]]
+        as_of_dates = [norm_date(d) for d in grid["as_of_dates"]]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise RuntimeError(f"reference bundle unusable: {exc}") from exc
+    ref_index, err_i = parse_csv(
+        reference.get("reports_index.csv"), INDEX_COLUMNS, "reference reports_index.csv"
     )
-    score = max(0.0, min(1.0, score))
-    return ScoreResult(
-        score,
-        score >= PASS_THRESHOLD,
+    ref_fin, err_f = parse_csv(
+        reference.get("financials_ytd.csv"), FIN_COLUMNS, "reference financials_ytd.csv"
+    )
+    ref_ttm, err_t = parse_csv(reference.get("pit_ttm.csv"), TTM_COLUMNS, "reference pit_ttm.csv")
+    for err in (err_i, err_f, err_t):
+        if err:
+            raise RuntimeError(err)
+    if (
+        not manifest
+        or not tickers
+        or not as_of_dates
+        or not ref_index
+        or not ref_fin
+        or not ref_ttm
+    ):
+        raise RuntimeError("reference bundle is empty")
+
+    errors: dict[str, str] = {}
+    index_rows, err = parse_csv(
+        outputs.get("reports_index.csv"), INDEX_COLUMNS, "output/reports_index.csv"
+    )
+    if err:
+        errors["index"] = err
+    fin_rows, err = parse_csv(
+        outputs.get("financials_ytd.csv"), FIN_COLUMNS, "output/financials_ytd.csv"
+    )
+    if err:
+        errors["financials"] = err
+    ttm_rows, err = parse_csv(outputs.get("pit_ttm.csv"), TTM_COLUMNS, "output/pit_ttm.csv")
+    if err:
+        errors["pit_ttm"] = err
+
+    result = ScoreResult(
+        0.0,
+        False,
         "scored",
-        downloads_score=downloads_score,
-        index_score=index_score,
-        financials_score=financials_score,
-        pit_ttm_score=pit_ttm_score,
-        n_required_reports=len(required_ids),
-        n_downloads_ok=n_dl_ok,
-        n_index_ok=n_index_ok,
-        n_financials_ok=n_fin_ok,
-        n_ttm_ok=n_ttm_ok,
-        n_ttm_rows=len(ttm_rows),
-        tickers_ttm_ok=tickers_ttm_ok,
+        fixture_mode=fixture_mode,
+        n_required_reports=len(manifest),
+        n_ttm_rows=len(ttm_rows or []),
         tickers_total=len(tickers),
-        tickers_ttm_wrong=sorted(wrong_tickers),
+        tickers_ttm_wrong=sorted(tickers),
     )
+
+    if not fixture_mode:
+        result.downloads_score, result.n_downloads_ok = _score_downloads(downloaded or {}, manifest)
+    if index_rows is not None:
+        result.index_score, result.n_index_ok, result.n_index_extra = _score_index(
+            index_rows, ref_index
+        )
+    if fin_rows is not None:
+        result.financials_score, result.n_financials_ok = _score_financials(fin_rows, ref_fin)
+    if ttm_rows is not None:
+        score, rows_ok, wrong, mism, err = _score_pit_ttm(
+            ttm_rows, index_rows, fin_rows, ref_ttm, tickers, as_of_dates
+        )
+        (
+            result.pit_ttm_score,
+            result.n_ttm_rows_ok,
+            result.tickers_ttm_wrong,
+            result.provenance_mismatches,
+        ) = score, rows_ok, wrong, mism
+        result.tickers_ttm_ok = len(tickers) - len(wrong)
+        if err:
+            errors["pit_ttm"] = err
+
+    weights = dict(WEIGHTS)
+    if fixture_mode:
+        weights.pop("downloads")
+        total = sum(weights.values())
+        weights = {k: v / total for k, v in weights.items()}
+    result.score = max(
+        0.0, min(1.0, sum(weights[k] * getattr(result, f"{k}_score") for k in weights))
+    )
+    result.passed = result.score >= PASS_THRESHOLD
+    result.component_errors = errors
+    if errors and all(k in errors for k in ("index", "financials", "pit_ttm")):
+        result.reason = "no scorable output"
+    elif errors:
+        result.reason = "scored with component errors: " + "; ".join(
+            f"{k}: {v}" for k, v in errors.items()
+        )
+    return result
+
+
+def is_fixture_dir(output_dir: str) -> bool:
+    return Path(str(output_dir).replace("\\", "/")).name.lower() in FIXTURE_DIR_NAMES
 
 
 def md5_of_dir(directory: Path) -> dict[str, str]:
-    import hashlib
-
     out = {}
     if not directory.is_dir():
         return out
@@ -373,5 +515,7 @@ if __name__ == "__main__":
             "grid.json",
         )
     }
-    result = score_submission(outputs, md5_of_dir(out / "downloads"), reference)
+    result = score_submission(
+        outputs, md5_of_dir(out / "downloads"), reference, fixture_mode=is_fixture_dir(str(out))
+    )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True, ensure_ascii=False))
