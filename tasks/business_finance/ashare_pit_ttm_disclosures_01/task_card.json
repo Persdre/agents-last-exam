@@ -1,0 +1,126 @@
+{
+  "taskId": "business_finance/ashare_pit_ttm_disclosures_01",
+  "title": "A-share Point-in-Time TTM Earnings from cninfo Disclosures",
+  "summary": "Discover and download the 160 periodic reports (2021Q3 to 2024Q3, including corrected re-issues) of 12 A-share companies from 巨潮资讯网 (cninfo), extract year-to-date revenue and attributable net profit from each report's 主要会计数据 table, and build a point-in-time trailing-twelve-month series over eight quarter-end as-of dates that honours announcement dates and corrections.",
+  "category": "business_finance",
+  "software": [
+    "Python",
+    "pandas",
+    "pdfplumber",
+    "requests",
+    "Google Chrome"
+  ],
+  "taskPrompt": "You are the research analyst on a China A-share equity desk. Rebuild the desk's point-in-time earnings history for 12 listed companies directly from their periodic reports on 巨潮资讯网 (cninfo), the CSRC-designated disclosure platform.\n\nTask directory: `base`\n\nRead first, in this order:\n- Task brief: `base/input/task_brief.md`\n- Normative specification (the grader implements exactly this): `base/input/spec.md`\n- Output schema: `base/input/output_contract.json`\n\nInputs:\n- Universe: `base/input/universe.csv` (12 tickers with cninfo security codes)\n- As-of dates: `base/input/as_of_dates.csv` (8 quarter ends)\n\nDeliverables under `base/output`:\n- `downloads/<announcement_id>.PDF`: every required full-text quarterly, half-year and annual report announced 2021-10-01 to 2024-12-31, including corrected re-issues (更正后), byte-identical to the file served by cninfo\n- `reports_index.csv`: one row per downloaded report with ticker, cninfo announcement id, title, announce date, report period, report type (Q1/H1/Q3/FY), correction flag, file\n- `financials_ytd.csv`: year-to-date 营业收入 and 归属于上市公司股东的净利润 from each report's 主要会计数据 table, in CNY yuan\n- `pit_ttm.csv`: for each ticker and as-of date, the trailing-twelve-month revenue and attributable net profit knowable on that date from reports announced on or before it, with the latest report used and the method\n\nRequirements:\n- Data may come only from www.cninfo.com.cn and static.cninfo.com.cn. No third-party data providers or aggregators.\n- Figures are taken as printed in each report and converted with that table's stated unit (元 / 千元 / 万元 / 百万元 / 亿元).\n- A-share quarterly figures are cumulative year-to-date; the TTM bridge and the point-in-time rules in `base/input/spec.md` are binding.\n- Be polite to cninfo: about one request per second.\n- Python with pandas, requests and pdfplumber is available via `base/software/python.sh` (first call creates a virtual environment from `base/input/runtime_env/requirements.txt`). Any other tooling is acceptable if the outputs match the contract.\n- Do not modify files under `base/input`.\n- The grader re-derives `pit_ttm.csv` from your own `reports_index.csv` and `financials_ytd.csv` and rejects a submission whose TTM table does not follow from them.\n",
+  "agentMustDo": [
+    "Read task_brief.md, spec.md and output_contract.json in full before starting.",
+    "Query cninfo's announcement search for each universe company and identify every full-text Q1, H1, Q3 and FY report announced 2021-10-01 to 2024-12-31, including corrected re-issues, excluding summaries, English versions and non-report announcements.",
+    "Download each required report PDF byte-identical from static.cninfo.com.cn into output/downloads/<announcement_id>.PDF.",
+    "Extract year-to-date 营业收入 and 归属于上市公司股东的净利润 from each report's 主要会计数据 table and convert to CNY yuan using the table's stated unit.",
+    "Assemble the point-in-time TTM series per ticker and as-of date using announcement dates, the latest-announced version of each period, and the year-to-date bridge.",
+    "Write reports_index.csv, financials_ytd.csv and pit_ttm.csv exactly as specified in output_contract.json."
+  ],
+  "inputFiles": [
+    {
+      "name": "task_brief.md",
+      "format": "Markdown",
+      "path": "input/task_brief.md",
+      "description": "Desk context, deliverables, practical notes on cninfo's API and A-share reporting conventions."
+    },
+    {
+      "name": "spec.md",
+      "format": "Markdown",
+      "path": "input/spec.md",
+      "description": "Normative rules: required reports, figure extraction, unit conversion, point-in-time availability, corrections, TTM bridge."
+    },
+    {
+      "name": "output_contract.json",
+      "format": "JSON",
+      "path": "input/output_contract.json",
+      "description": "Exact schema of the four deliverables."
+    },
+    {
+      "name": "universe.csv",
+      "format": "CSV",
+      "path": "input/universe.csv",
+      "description": "12 companies: ticker, cninfo security code, name, exchange (SSE main board, SZSE main board, ChiNext, STAR)."
+    },
+    {
+      "name": "as_of_dates.csv",
+      "format": "CSV",
+      "path": "input/as_of_dates.csv",
+      "description": "Eight quarter-end as-of dates, 2023-03-31 to 2024-12-31."
+    },
+    {
+      "name": "runtime_env/requirements.txt",
+      "format": "Text",
+      "path": "input/runtime_env/requirements.txt",
+      "description": "Pinned pandas / requests / pdfplumber versions for the staged runtime."
+    },
+    {
+      "name": "software/python.sh",
+      "format": "Shell script",
+      "path": "software/python.sh",
+      "description": "Canonical Python entry point; creates the virtual environment on first call."
+    }
+  ],
+  "referenceFiles": [
+    {
+      "name": "file_manifest.json",
+      "format": "JSON",
+      "path": "reference/file_manifest.json",
+      "description": "Required cninfo announcement ids with MD5 and size of the served PDF, ticker, title and announce date."
+    },
+    {
+      "name": "reports_index.csv",
+      "format": "CSV",
+      "path": "reference/reports_index.csv",
+      "description": "Classification of every required report (period, type, correction flag, announce date)."
+    },
+    {
+      "name": "financials_ytd.csv",
+      "format": "CSV",
+      "path": "reference/financials_ytd.csv",
+      "description": "Year-to-date revenue and attributable net profit per report in CNY yuan, extracted from the PDFs and cross-checked against East Money's earnings tables."
+    },
+    {
+      "name": "pit_ttm.csv",
+      "format": "CSV",
+      "path": "reference/pit_ttm.csv",
+      "description": "Point-in-time TTM series produced by the normative rules from the reference index and financials."
+    },
+    {
+      "name": "grid.json",
+      "format": "JSON",
+      "path": "reference/grid.json",
+      "description": "The (ticker, as_of_date) grid pit_ttm.csv must cover."
+    }
+  ],
+  "evaluation": "**Hard gate conditions** (score = 0 when any triggers)\n- Any of `output/reports_index.csv`, `output/financials_ytd.csv`, `output/pit_ttm.csv` missing, unparseable, or with columns other than the contract\n- `pit_ttm.csv` does not contain exactly one row per (ticker, as-of date) of the grid (96 rows)\n- Provenance: the grader re-derives the TTM table from the submitted `reports_index.csv` and `financials_ytd.csv` under the spec (announce-date availability, latest-announced version per period, YTD bridge); any row whose method, latest report or values disagree with that derivation rejects the submission\n\n**Scoring method** (deterministic, host-side, standard library only; MD5s computed on the VM)\n1. Downloads (weight 0.15): share of the 160 required cninfo announcement ids present in `output/downloads/` whose MD5 equals the served file's.\n2. Report index (weight 0.10): share of required reports whose ticker, announce date, report period, report type and correction flag are all correct; extra rows cost half a point each.\n3. Financials (weight 0.30): share of required reports whose revenue and attributable net profit both match the reference within 0.5% relative (or 1 yuan absolute).\n4. Point-in-time TTM (weight 0.45): share of the 12 tickers whose entire as-of series (8 rows: method, latest announcement id, TTM revenue, TTM net profit within the same tolerance) matches the reference. One wrong row makes the ticker wrong, because it means the point-in-time logic is wrong.\n\n**Current pass threshold:** 0.97 (a submission with any ticker's TTM series wrong cannot pass).\n\n**Calibration** (reference outputs with one realistic mistake injected, `authoring/calibrate.py`): reference vs reference 1.000; corrected re-issues ignored 0.945; corrected figures backfilled onto the original announcement date 0.959; banks' 百万元 tables read as 元 0.877; East Money aggregator values instead of the printed figures 0.809; report period used as availability date 0.450; Q3 quarter-only column instead of year-to-date 0.459; annual reports missing 0.420. All fail.\n\n**Reference provenance**: PDFs and announcement metadata from cninfo; figures extracted from the 主要会计数据 tables and cross-checked against East Money's 业绩报表 (158 of 161 agree within 0.5%; the two disagreements are the 凯因科技 corrected re-issues, where the aggregator still carries the original figures; one 0.6% difference is a later restatement). Two report files with an unreadable text layer (天合光能 FY2021 original and revised edition) were read from the rendered page. One announcement (凯因科技 2023年第三季度报告（更正后）) is served by cninfo as a non-PDF file and is excluded from the required set.\n\n**What does a perfect output look like?**\nAll 160 required PDFs present and byte-identical, an index that classifies each report correctly, figures that match the printed tables in yuan, and a TTM table equal to the reference on all 96 rows.\n\n**What does a wrong output look like?**\nMissing or extra reports, summaries instead of full text, values in 万元 or 百万元, TTM built from figures not yet announced or from corrected figures applied before their announcement, aggregator numbers instead of the reports, or a TTM table that cannot be reproduced from the submitted index and financials.",
+  "vm": {
+    "machineType": "c4-standard-4",
+    "snapshot": "cpu-free-ubuntu",
+    "timeout": 10800
+  },
+  "variants": 1,
+  "taxonomy": {
+    "domain_id": "6",
+    "domain_code": "business_finance",
+    "subdomain_id": "6.1",
+    "subdomain_code": "accounting_finance",
+    "subdomain_name": "Accounting & Finance",
+    "classifier": {
+      "model": "manual",
+      "source": {
+        "fields": [
+          "taskPrompt",
+          "title",
+          "summary",
+          "software"
+        ],
+        "mode": "author"
+      },
+      "rationale": "Primary-source financial statement collection and point-in-time earnings assembly is core equity research and accounting work."
+    }
+  },
+  "requiredSystemPackages": []
+}
